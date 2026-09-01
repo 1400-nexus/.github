@@ -24,10 +24,10 @@ Triplet track — 8 processes, Reed–Solomon FEC, zero-copy data plane, Python 
 עוברת דרך Python — לא בצד המקור ולא בצד היעד. כלל ההודעות ברשת וב-IPC מקודדות ב-Protobuf,
 ותקשורת פנים-מחשבית מתבצעת ב-Unix Domain Sockets.
 
-ה"תיקייה" בשני הצדדים היא **דלי אחסון S3** (MinIO) — דלי מקור בצד TX ודלי יעד בצד RX, ללא כל
-קשר ישיר ביניהם. במילים אחרות: **Uniflow הוא מנגנון השכפול החד-כיווני בין שני דלי S3.**
-בנוסף קיים שער אופציונלי ב-NestJS המבצע אימות משתמשים והרשאות **לפי יכולת שנבדקת בזמן ריצה**
-ולא לפי תפקיד שהוקצה מראש.
+**ניטור הקבצים מתבצע ב-inotify על תיקיית המקור המקומית בצד TX**, בהתאם לדרישה. בנוסף קיימת
+שכבה אופציונלית: תהליך `s3_sync` המושך אובייקטים מדלי MinIO אל אותה תיקייה, ושער NestJS
+המבצע אימות משתמשים והרשאות **לפי יכולת הנבדקת בזמן ריצה** ולא לפי תפקיד שהוקצה מראש.
+השכבה האופציונלית אינה חלק משמונת התהליכים הנבחנים, והמערכת פועלת במלואה בלעדיה.
 
 ---
 
@@ -35,6 +35,7 @@ Triplet track — 8 processes, Reed–Solomon FEC, zero-copy data plane, Python 
 
 1. [The design thesis](#1-the-design-thesis)
 2. [Quick start](#2-quick-start)
+   - [1.3 Requirement compliance map](#13-requirement-compliance-map)
 3. [Process roster](#3-process-roster)
 4. [Architecture diagrams](#4-architecture-diagrams)
 5. [Service specifications](#5-service-specifications)
@@ -93,6 +94,42 @@ This is the whole design in one table. It is the thing to explain first in a def
 Misrouting is the interesting one: it costs **zero** in this architecture. Not a
 retransmit, not a forward, not even a `memcpy`. See [§5.3](#53-receiver-c20-rx-3).
 
+### 1.3 Requirement compliance map
+
+Every requirement in the brief, and where it is satisfied. Check this before submission.
+
+| Requirement | Where | Status |
+|---|---|---|
+| 8 processes: File Monitor + 3 Senders / 3 Receivers + Session Manager | [§3](#3-process-roster) | ✅ |
+| Receivers listen in parallel on **different ports** | 9001 / 9002 / 9003 | ✅ |
+| Large file (10 MB – 1 GB) split, 3 Senders → 3 Receivers in parallel | [§5.1](#51-file_monitor-python-tx-1) | ✅ |
+| Small file (<10 MB): single Sender ↔ single Receiver | [§4.4](#44-small-files-10-mb-dedicated-pairs) | ✅ |
+| Multiple small files in parallel, each a **dedicated pair** | [§4.4](#44-small-files-10-mb-dedicated-pairs) | ✅ |
+| ≥1 Python **and** ≥1 C++ process per machine | [§3](#3-process-roster) | ✅ |
+| **File monitoring: creation and modification events in the TX source folder** | [§5.1](#51-file_monitor-python-tx-1) — inotify `IN_CLOSE_WRITE` + `IN_MOVED_TO` | ✅ |
+| IPC via **Unix Domain Sockets** | [§7](#7-ipc-contracts), [§8.1](#81-uds-versus-shared-memory-compliance) | ✅ (raise the arena with mentors) |
+| All network and IPC messages via **Protobuf** | [§6](#6-wire-protocol) — prefix is a transport envelope, justified in [§6.2](#62-why-the-prefix-is-not-optional) | ✅ |
+| Integrity: hash at destination compared to source | BLAKE3 in `Manifest`, verified pre-publication | ✅ |
+| Full support up to **1 GB** | [§13](#13-sizing-math) | ✅ |
+| Session Manager centralizes reports, unifies them, **displays status** | [§5.4](#54-session_manager-python-rx-1) | ✅ |
+| Withstands bit flips, packet loss, misrouting | [§1.2](#12-one-mechanism-four-failure-modes), [§9](#9-forward-error-correction) | ✅ |
+| Git showing joint, organized work by all members | [§18.1](#181-split) | ⚠️ requires deliberate effort |
+| README with run instructions, architecture, usage examples | this file | ✅ |
+| Documented source code | per-module docstrings | — during implementation |
+
+**Two things to raise with the mentors early, in writing:**
+
+1. **The shared slot arena between receivers** ([§8.1](#81-uds-versus-shared-memory-compliance)).
+   It carries payload, not messages, and every message stays UDS + Protobuf — but confirm
+   they read it the same way. A UDS fallback exists and is described there.
+2. **Whether the optional tier is welcome.** MinIO, the NestJS gateway and the UI are all
+   beyond the brief. Nothing requires them and everything works without them, but a mentor
+   should not be surprised by them on demo day.
+
+**Everything optional stays cuttable.** The eight graded processes run with `s3_sync`, the
+gateway, the UI and MinIO all absent. That is a property to test, not just to assert — it is
+a row in the test matrix ([§15](#15-testing-harness)).
+
 ---
 
 ## 2. Quick start
@@ -108,7 +145,7 @@ retransmit, not a forward, not even a `memcpy`. See [§5.3](#53-receiver-c20-rx-
 | Intel ISA-L (`libisal-dev`) | Reed–Solomon over GF(2⁸), AVX2 | `apt install libisal-dev` |
 | BLAKE3 (`libblake3`) | integrity hashing | build from source, pin the version |
 | Python ≥ 3.11 | control plane | — |
-| `pybind11`, `protobuf`, `numpy`, `boto3` | Python deps | `pip install -r requirements.txt` |
+| `pybind11`, `protobuf`, `numpy`, `inotify_simple`, `boto3` | Python deps (`boto3` only for the optional `s3_sync`) | `pip install -r requirements.txt` |
 | **MinIO** (S3-compatible object store) | the "folder" — source bucket on TX, destination bucket on RX | see [§2.2](#22-object-storage-minio-not-aws) |
 | **Node ≥ 20**, NestJS ≥ 10 | optional gateway | `npm i -g @nestjs/cli` |
 | `iproute2` (`tc`) | test harness | `apt install iproute2` |
@@ -189,14 +226,20 @@ supervisors drop privileges immediately afterwards.
 ### 2.6 Usage examples
 
 ```bash
-# Transfer a file: put an object in the source bucket. Any route works —
-# the bucket is the single source of truth, not any particular client.
+# Transfer a file: put it in the TX source folder. This is the ONLY detection
+# path — inotify fires and file_monitor takes over.
+cp bigfile.iso /var/uniflow/watch/
+
+# Optional: dropping it in the bucket instead. s3_sync downloads and renames it
+# into the same folder, so detection is identical.
 mc cp bigfile.iso local/uniflow-src/
 
 # Watch progress on RX.
 tail -f /var/log/uniflow/session_manager.log
 
-# Received objects land here only after BLAKE3 verifies.
+# Received files land in the RX output folder only after BLAKE3 verifies,
+# and are then uploaded to the destination bucket if MinIO is enabled.
+ls /var/uniflow/out/
 mc ls local/uniflow-dst/
 
 # Change the send rate mid-run, no restart (hot reload, applies within ~50 ms).
@@ -237,6 +280,7 @@ Eight processes. **Not six** — the triplet track is 4 on each side.
 | 2–4 | `sender` | TX | **C++20** | 3 | Yes (`mmap`) |
 | 5–7 | `receiver` | RX | **C++20** | 3 | Yes (`recvmmsg` → shm) |
 | 8 | `session_manager` | RX | **Python** | 1 | **No** — bitmaps only |
+| — | `s3_sync` | TX | Python | 1, optional | Yes — bucket → source folder |
 | — | `gateway` | TX and/or RX | **TypeScript / NestJS** | 1, optional | No — issues presigned URLs |
 | — | `ui` | served by `gateway` | TypeScript | — | No — browser ↔ MinIO direct |
 | — | `minio` | both | Go (third party) | 1 per machine | Yes — it *is* the store |
@@ -250,9 +294,10 @@ That single sentence is the strongest claim in the design. The `session_manager`
 responsible per the brief for aggregating status from all three receivers — it aggregates
 **bitmaps**, not data. Its entire authoritative view of a 1 GB transfer is 480 bytes.
 
-**The eight numbered processes are the graded system.** The gateway, UI and MinIO are an
-optional tier ([§5.5](#55-gateway-typescript--nestjs-optional)); the transfer path must run
-and be demonstrable with all three absent. Adding TypeScript does not affect the language
+**The eight numbered processes are the graded system.** `s3_sync`, the gateway, the UI and
+MinIO are an optional tier; the transfer path must run and be demonstrable with **all four
+absent** — at which point files enter the pipeline by `cp` into the watched folder, exactly
+as the brief describes. Adding TypeScript does not affect the language
 requirement, which is already met by Python + C++ on each machine.
 
 ---
@@ -266,9 +311,10 @@ flowchart TB
   subgraph TX["TX — Sender Machine"]
     UI["ui (browser)"]
     GW["gateway (NestJS)<br/>authn + capability guard<br/>mints presigned URLs only"]
-    WD[("MinIO bucket uniflow-src<br/>THE SINGLE SOURCE OF TRUTH")]
-    HYD[("hydration cache<br/>local disk")]
-    FM["file_monitor (Python)<br/>poll+diff · hydrate · BLAKE3 · plan<br/>metadata only · supervises senders"]
+    WD[("MinIO bucket uniflow-src")]
+    SY["s3_sync (optional feeder)<br/>poll · download · atomic rename<br/>NOT one of the 8 processes"]
+    HYD[("/var/uniflow/watch<br/>TX SOURCE FOLDER — inotify target")]
+    FM["file_monitor (Python)<br/>inotify · BLAKE3 · plan<br/>metadata only · supervises senders"]
     S0["sender 0 (C++20)"]
     S1["sender 1 (C++20)"]
     S2["sender 2 (C++20)"]
@@ -292,8 +338,10 @@ flowchart TB
   UI -->|"presigned PUT/DELETE — payload goes browser→MinIO direct"| WD
   UI -.->|"authn + authz only, never payload"| GW
   GW -.->|"mint presigned URL"| WD
-  WD -->|"poll ListObjectsV2 + version diff (5 s)"| FM
-  FM -->|"GetObject → stream to disk, BLAKE3 in the same pass"| HYD
+  WD -->|"poll + download"| SY
+  SY -->|"atomic rename → IN_MOVED_TO"| HYD
+  HYD -->|"inotify IN_CLOSE_WRITE / IN_MOVED_TO"| FM
+  CP["cp · scp · scripts"] -->|"IN_CLOSE_WRITE"| HYD
   FM -.->|"UDS SEQPACKET + protobuf<br/>AssignSession: local path + block predicate"| S0
   FM -.->|UDS| S1
   FM -.->|UDS| S2
@@ -328,7 +376,8 @@ flowchart TB
 
 ```mermaid
 sequenceDiagram
-    participant S3 as MinIO uniflow-src
+    participant SY as s3_sync (optional)
+    participant FS as /var/uniflow/watch
     participant FM as file_monitor (Py)
     participant S as sender×3 (C++)
     participant R as router
@@ -337,12 +386,11 @@ sequenceDiagram
     participant SM as session_manager (Py)
     participant DB as MinIO uniflow-dst
 
-    FM->>S3: ListObjectsV2 (poll, 5 s)
-    FM->>FM: diff vs known versions → new object detected
-    FM->>S3: GetObject (stream)
-    FM->>FM: hydrate to local cache + BLAKE3 in ONE pass · build Manifest · pick K
+    SY->>FS: download to temp, atomic rename
+    FS->>FM: inotify IN_MOVED_TO / IN_CLOSE_WRITE
+    FM->>FM: debounce 200 ms · BLAKE3 · build Manifest · pick K
     FM->>S: AssignSession(manifest, local path, block_id % 3 == j, rate_limit)
-    S->>S: mmap hydrated file (no bytes over IPC)
+    S->>S: mmap source file (no bytes over IPC)
 
     loop per stripe of 128 blocks
         S->>S: RS encode 200 → 255 symbols (ISA-L, AVX2)
@@ -366,7 +414,7 @@ sequenceDiagram
 
 ### 4.3 Trace of one symbol
 
-A poll cycle spots a new object version → `file_monitor` hydrates and hashes it in one pass
+`IN_CLOSE_WRITE` fires on the TX source folder → `file_monitor` debounces, hashes and plans
 → `AssignSession` over UDS to Sender 1
 → Sender 1 reads the symbol from its `mmap` → RS-encodes the block → frames as
 `[prefix | CRC32C][protobuf DataPacket]` → the token bucket admits it → `sendmmsg` → the
@@ -381,6 +429,35 @@ on its next 50 ms poll.
 Note what did **not** happen: no copy of the payload, no cross-receiver message, no
 correction for the misroute.
 
+### 4.4 Small files (<10 MB): dedicated pairs
+
+The brief is specific: a small file goes through a **single Sender against a single
+Receiver**, and the triplet track must additionally support several small files in parallel,
+each with its **own dedicated Sender–Receiver pair**.
+
+`file_monitor` assigns the *i*-th concurrent small file to Sender `i mod 3`, targeting port
+`9001 + (i mod 3)`. Three small files in flight therefore occupy three disjoint pairs:
+
+| File | Sender | Target port | Receiver |
+|---|---|---|---|
+| A | 0 | 9001 | 0 |
+| B | 1 | 9002 | 1 |
+| C | 2 | 9003 | 2 |
+
+RS coding still applies; the final block is zero-padded to `K`.
+
+**Log the pairing explicitly** on assignment — `session … → sender 1 → :9002` — and
+demonstrate three concurrent small files over three distinct pairs. Do not leave a mentor to
+infer that the requirement is met.
+
+Because receivers are stateless, the dedicated pair is a **TX scheduling decision**, not an
+RX constraint. That is what makes it robust: the pairing is honoured on the sending side
+exactly as the brief requires, and a misrouted packet still lands correctly anyway.
+
+> **The misrouting test in [§15](#15-testing-harness) deliberately violates this pairing** by
+> pointing all traffic at one port. That is fault injection, never the running configuration.
+> Normal operation is always three senders against three receivers on three ports.
+
 ---
 
 ## 5. Service specifications
@@ -391,8 +468,8 @@ Planner, dispatcher, and TX supervisor. Owns every TX-side decision.
 
 **Purpose** — notice files, plan their transfer, hand plans to senders, aggregate TX status.
 
-**Inputs** — the `uniflow-src` MinIO bucket (polled); UDS connections from senders;
-`link_profile.json`; `uniflow.toml`.
+**Inputs** — **inotify events on the local source directory** (`/var/uniflow/watch`); UDS
+connections from senders; `link_profile.json`; `uniflow.toml`.
 
 **Outputs** — `AssignSession` / `UpdateRate` / `Abort` over UDS; TX status log.
 
@@ -400,69 +477,79 @@ Planner, dispatcher, and TX supervisor. Owns every TX-side decision.
 size, hash, block count, sender→block assignment, per-sender progress) and the
 **seen-versions set**, persisted to disk so a restart does not re-send the whole bucket.
 
-> **Detection changed with S3, and this is the one real cost of the change.** There is no
-> inotify on object storage. See [§5.1.1](#511-why-polling-and-not-bucket-notifications).
+> **`file_monitor` does not talk to S3 at all.** The brief requires listening to creation
+> and modification events on the TX source folder, so detection is inotify on a local
+> directory, full stop. Objects reach that directory via a separate `s3_sync` feeder
+> ([§5.1.1](#511-s3_sync--the-feeder-not-the-detector)), and a file placed there by `cp`,
+> `scp`, or a script is indistinguishable from one that arrived via the bucket. **One
+> detection path, whatever the origin.**
 
 **Sequence:**
 
-1. **Poll** `ListObjectsV2` every 5 s and diff `(key, version_id, etag, size)` against the
-   seen-versions set. A new or changed version is a new session; a delete is ignored
-   ([§5.1.2](#512-what-the-ui-can-and-cannot-do)).
-2. **Hydrate** — `GetObject` and stream to the local cache, computing **BLAKE3 in the same
-   pass**. One read, both results. This step exists because you cannot `mmap` an S3 object,
-   and the entire zero-copy sender path depends on a local file.
-3. Build the **Manifest**: `session_id`, `relpath` (= object key), `file_size`, `hash`, `K`,
-   `N`, `symbol_bytes`, `total_blocks`, `tx_rate_bps`, `src_version_id`.
+1. **Detect** — inotify on the source directory. Watch `IN_CLOSE_WRITE` **and**
+   `IN_MOVED_TO`, which together cover the brief's "creation and modification" requirement.
+   Do **not** watch `IN_CREATE`: it fires before the file is fully written.
+2. **Debounce** 200 ms of quiet, then stat the file and compute **BLAKE3** on an executor
+   with the GIL released. It reads the file but never puts its bytes in a message.
+3. Build the **Manifest**: `session_id`, `relpath` (path relative to the source dir),
+   `file_size`, `hash`, `K`, `N`, `symbol_bytes`, `total_blocks`, `tx_rate_bps`, and
+   `src_version_id` when the file arrived via `s3_sync` (provenance only).
 4. Choose `K` from the loss→K table using the measured loss in `link_profile.json`
    ([§9.3](#93-choosing-k)).
-5. Route. **Small file (<10 MB)** → assign the whole file to the least-loaded sender.
-   **Large file** → shard across all three: sender *j* takes blocks where
+5. Route, per the brief's thresholds. **Small file (<10 MB)** → one sender, one receiver,
+   as a **dedicated pair** ([§4.4](#44-small-files-10-mb-dedicated-pairs)). **Large file
+   (10 MB – 1 GB)** → shard across all three: sender *j* takes blocks where
    `block_id % 3 == j`.
-6. Send `AssignSession` with the manifest, the **local hydrated path**, and the block
-   predicate.
-7. Track `SenderProgress`; log completion; re-plan if a sender dies; evict the hydrated
-   file from the cache when all senders report complete.
+6. Send `AssignSession` with the manifest, the local path, and the block predicate.
+7. Track `SenderProgress`; log completion; re-plan if a sender dies.
 
 **Explicitly does not** — put file bytes into a message, touch the network, encode
-anything, hold payload in memory, or accept a push from the gateway.
+anything, hold payload in memory, talk to S3, or accept a push from the gateway.
 
-#### 5.1.1 Why polling, and not bucket notifications
+#### 5.1.1 `s3_sync` — the feeder, not the detector
 
-MinIO can push events (webhook, AMQP, NATS) on `PutObject`. Tempting, and ~200 ms faster.
-Rejected as the primary mechanism for one reason: **a push path that can be missed is a
-push path that will be missed**, and a dropped notification means a file silently never
-transfers. Poll-and-diff is self-healing — a missed cycle is corrected by the next one.
+A **separate, optional** process that mirrors `uniflow-src` into the local source directory.
+It is not one of the eight graded processes and the transfer path runs without it.
 
-Optional acceleration, if there is time: subscribe to notifications *and* keep the 5 s poll
-as reconciliation. The notification shortens latency; the poll remains the guarantee. Do not
-ship the notification path alone.
+**Responsibility:** poll `ListObjectsV2` every 5 s, diff `(key, version_id, etag, size)`
+against a persisted seen-versions set, download new versions to a temp name, then
+**atomically rename into the source directory** — which is what fires `IN_MOVED_TO` and hands
+detection back to `file_monitor`.
 
-Polling also preserves the invariant from the original design: **there is exactly one
-detection path**, whatever the object's origin. UI upload, `mc cp`, a script, a restored
-backup — all identical to `file_monitor`. The gateway never notifies it directly.
+**Why the split matters.** The brief requires monitoring creation and modification events in
+the TX source folder, and it lists Linux file I/O among the graded topics. Detection is
+therefore inotify on a real directory. Bolting S3 polling into `file_monitor` would have
+replaced the graded mechanism with an ungraded one. Keeping `s3_sync` separate means the
+object store is a convenience feeding a compliant pipeline, and killing it changes nothing
+about how the system works.
+
+**Why polling and not bucket notifications.** MinIO can push events on `PutObject`, ~200 ms
+faster. Rejected as the primary mechanism: **a push path that can be missed is a push path
+that will be missed**, and a dropped notification means a file silently never transfers.
+Poll-and-diff is self-healing — a missed cycle is corrected by the next one. Optional
+acceleration if there is time: subscribe to notifications *and* keep the poll as
+reconciliation. Never ship the notification path alone.
+
+**Pitfalls:** download to a temp name and rename, or inotify sees a partially written file.
+Record a version as seen only after the rename succeeds. Paginate the listing.
 
 #### 5.1.2 What the UI can and cannot do
 
-The UI does full CRUD on `uniflow-src`. What each operation means to the transfer path:
+The UI does full CRUD on `uniflow-src`. What each operation means downstream:
 
 | UI action | S3 effect | Transfer effect |
 |---|---|---|
-| Create / upload | new object version | new session, sent |
-| Edit / replace | **new version id** | **new session**, whole object re-sent |
-| Rename | delete + put | new session under the new key |
-| Delete, before send | version gone | never detected, never sent |
+| Create / upload | new object version | synced, detected, sent |
+| Edit / replace | **new version id** | new file in the source dir, whole file re-sent |
+| Rename | delete + put | new session under the new name |
+| Delete, before sync | version gone | never appears locally, never sent |
 | **Delete, mid-flight** | version gone | **transfer continues to completion** |
 
 > **Delete is not a recall.** Once symbols are on the wire there is no mechanism to stop
-> them — the receiver cannot be told to cancel, because there is no back channel. This is
-> not an implementation gap; it is the medium. `file_monitor` pins the hydrated copy at
-> session start precisely so a mid-flight delete cannot corrupt a transfer into a
-> half-sent state. Say this out loud in a demo before someone discovers it by accident.
-
-There is also **no partial-write problem**, which is a genuine improvement over inotify. An
-S3 object does not exist until `CompleteMultipartUpload`, so the 200 ms debounce hack that
-the local-filesystem design needed is simply gone. Object versioning replaces it, and does
-the job properly.
+> them — the receiver cannot be told to cancel, because there is no back channel. This is not
+> an implementation gap; it is the medium. `file_monitor` opens and holds the local file for
+> the session's lifetime, so a mid-flight delete cannot tear a transfer into a half-sent
+> state. Demonstrate this deliberately before someone discovers it by accident.
 
 ### 5.2 `sender` (C++20, TX, ×3)
 
@@ -528,7 +615,8 @@ slot indices.
 
 **Decode/write thread** — CAS-claim the block, RS-decode from the 200 slots, write into the
 `mmap`ed destination at `block_id × K × symbol_bytes`, append to the journal, release all
-slots, notify the manager.
+slots, and **report `BlockDecoded` to the manager over UDS**. That UDS report is the
+authoritative progress record, not the shm bitmap ([§8.1](#81-uds-versus-shared-memory-compliance)).
 
 **Explicitly does not** — own a session, own a shard, check whether a packet "was for it",
 talk to another receiver, or verify the file hash.
@@ -556,23 +644,52 @@ report, supervise.
 
 **State it owns (sole writer)** — the session table in shm.
 
+> **Aggregation happens over UDS, not shared memory.** The brief requires that data transfer
+> between local processes uses Unix Domain Sockets, so the manager's completion state is
+> built from the `BlockDecoded` messages the receivers send it — that path is authoritative
+> and sufficient on its own. The shm bitmap read below is a **removable optimization** that
+> lets a 50 ms poll confirm aggregate progress in one popcount; delete it and the system
+> still works. See [§8.1](#81-uds-versus-shared-memory-compliance).
+
 **Loop:**
 
 1. On the first `ManifestSeen` for a session — validate it, `fallocate` and create the
    destination in `.partial/`, zero a block table and bitmap in shm, broadcast
    `SessionOpen` to all three receivers. **Single-writer session creation**, so there is no
    race between the three receivers.
-2. Every 50 ms — wrap the completion bitmap with `np.frombuffer` (a pointer wrap over
-   receiver memory: no copy, no serialization) and popcount it.
+2. Fold each `BlockDecoded` (UDS) into the session's completion set as it arrives. **This is
+   the authoritative record.** Every 50 ms, optionally cross-check it against the shm bitmap
+   via `np.frombuffer` and a popcount — a pointer wrap over receiver memory, no copy. A
+   divergence between the two is a bug worth logging loudly.
 3. Complete → BLAKE3-verify the staged file against the manifest on an executor with the
    GIL released, then **`PutObject` into `uniflow-dst`**. The object becoming visible in the
    bucket *is* the publication event — nothing unverified is ever uploaded.
 4. No forward progress for 8 s → declare failure and **name the specific undecodable
    blocks**. Do not publish.
 5. Aggregate per-receiver counters (CRC failures, kernel drops, arena exhaustion,
-   duplicates, per-stripe loss %) into one status view.
+   duplicates, per-stripe loss %) into one unified view.
+6. **Display that status.** The brief makes this an explicit responsibility of the Session
+   Manager — *"מרכז את הדיווחים … מאחד את המידע ומציג את הסטטוס"* — so it is a graded
+   deliverable, not a nicety. A refreshing console view showing, per session: state, blocks
+   decoded / total, observed loss %, and a per-receiver counter table. Terminal output
+   satisfies the requirement; no HTTP endpoint is needed, and the optional NestJS tier plays
+   no part in it. It is also what you will actually watch while tuning the rate on day 11
+   ([§10.5](#105-tier-3-hot-reload-plus-a-good-status-screen)).
 
 **Explicitly does not** — touch payload bytes, receive from the network, or decode.
+
+**Required display fields**, at minimum, per the brief's "unifies the information and
+displays the status":
+
+| Field | Source |
+|---|---|
+| session id, filename, size | `Manifest` |
+| state (`OPEN` / `VERIFIED` / `HASH_MISMATCH` / `INCOMPLETE`) | `SessionAuthority` |
+| blocks decoded / total, percentage | aggregated `BlockDecoded` over UDS |
+| observed loss %, per stripe | derived from arrival counts |
+| per-receiver: ok, crc_fail, dup, kernel_drops, arena_exhausted | `ReceiverStats` over UDS |
+| which receivers are alive | heartbeats |
+| final verdict and missing block ids | `ProgressAggregator` |
 
 > **Why it never sees payload.** The brief puts the session manager in the *reporting*
 > path. Routing a gigabyte through a Python process because a box on a diagram has an
@@ -703,6 +820,15 @@ closes the gap.
 
 > **Invariant: verify CRC, then parse. Never the reverse.**
 
+**On the brief's "all messages encoded via Protobuf" requirement.** The 12-byte prefix is not
+Protobuf, and that is deliberate — it is a *transport envelope* around the Protobuf message,
+not a replacement for it. Every message in the system, on the wire and over IPC, is a
+Protobuf message; the prefix exists solely because **Protobuf cannot be parsed safely on a
+channel that corrupts bits**, for the two reasons given above. Verifying integrity before
+handing bytes to the parser is the only way to stop a flipped bit in a varint length field
+from triggering a multi-gigabyte allocation. State this in the defense rather than letting a
+mentor find an unexplained non-Protobuf header.
+
 Defense in depth on the parser: `SetTotalBytesLimit` and arena allocation on the C++ side.
 
 ### 6.3 Network messages (TX → RX, one-way, no replies ever)
@@ -742,7 +868,7 @@ Two rules:
 | Dir | Message | Fields |
 |---|---|---|
 | S→M | `Hello` | sender_id, pid, version, **proto_hash** |
-| M→S | `AssignSession` | Manifest, source_path (**hydrated local path**, not an S3 URI), block_modulus, block_residue, target_host, target_port, rate_limit_bps |
+| M→S | `AssignSession` | Manifest, source_path (**local path in the watched folder**, never an S3 URI), block_modulus, block_residue, target_host, target_port, rate_limit_bps |
 | M→S | `UpdateRate` | rate_bps — applied at the next stripe boundary |
 | M→S | `Abort` | session_id |
 | S→M | `SenderProgress` | session_id, stripes_done, packets_sent, bytes_sent |
@@ -804,6 +930,31 @@ write; the session manager maps read-only except for the session table.
 > **Total user-space copies of a payload byte, wire to disk: zero.** The kernel writes into
 > a slot; filing a symbol is an index assignment; RS-decode writes into a `mmap`ed
 > destination file at its exact offset.
+
+### 8.1 UDS versus shared memory: compliance
+
+The brief states that data transfer between local processes shall use Unix Domain Sockets.
+Shared memory is not a UDS, so be precise about what travels where:
+
+| Path | Mechanism | Position |
+|---|---|---|
+| Every **message** between processes, both machines | UDS `SOCK_SEQPACKET` + Protobuf | Required, satisfied |
+| Receiver → manager progress and stats | UDS, **authoritative** | Required, satisfied |
+| Manager reading the completion bitmap | shm | **Optimization only.** Removable with no behavioural change |
+| Receivers filing symbols into a common slot arena | shm | A payload buffer, not a message channel — see below |
+
+**The arena is the one place worth raising with your mentors, and worth raising early —
+before day 9.** It is a shared packet buffer that makes misrouting cost nothing
+([§5.3](#53-receiver-c20-rx-3)); it carries no inter-process *messages*, and every message in
+the system remains UDS + Protobuf. That is a defensible reading, but it is a reading.
+
+**Fallback if they rule against it:** a receiver that gets a symbol for a block it did not
+open forwards that symbol to the owning receiver **over UDS**. Fully compliant, and
+misrouting then costs one local IPC hop instead of nothing. Slower and less elegant — but it
+works, and knowing the fallback exists is what makes the question safe to ask.
+
+Ask in writing, early. The answer changes two to three days of B's work, and asking costs one
+message.
 
 **Arena exhaustion is a legitimate signal, not an error.** When `acquire()` returns `kNil`
 the decode path is behind the wire, so the receiver drops the packet deliberately. That
@@ -927,8 +1078,13 @@ graded transfer never touches it.
 1. Read NIC link speed via `ethtool` on both ends; ceiling = `min(tx, rx)`.
 2. Send a **rate ladder** — ~2 s each at 10/20/40/60/80/100% of the ceiling, tagged with
    `RateLadderMark`.
-3. RX counts arrivals per rung and reports the loss-vs-rate curve back over SSH.
-4. Find the knee; write `link_profile.json`:
+3. RX counts arrivals per rung and **prints the loss-vs-rate curve to its own console.**
+   A human reads that screen and types the chosen ceiling into TX's config. **Nothing is
+   transmitted from RX back to TX — not over SSH, not over anything.** An operator reading a
+   number off one screen and typing it into another is not a channel, and this removes the
+   only part of the design that could be mistaken for a way around the brief's central
+   constraint.
+4. Find the knee; write `link_profile.json` on TX:
    `{measured_capacity_bps, knee_bps, measured_loss_at_knee, timestamp, path_id}`.
 5. Operating ceiling = **60–70% of the knee**.
 
@@ -1129,7 +1285,8 @@ restart_backoff_s     = [1, 2, 4, 8, 16, 30]
 crashloop_threshold   = 5       # deaths within 60 s → DEGRADED
 
 [paths]
-hydration_cache       = "/var/uniflow/cache"    # S3 objects land here so senders can mmap
+watch_dir             = "/var/uniflow/watch"    # TX SOURCE FOLDER — the inotify target,
+                                                # and the only detection path (brief req.)
 staging_dir           = "/var/uniflow/.partial" # RX decode target, pre-verification
 journal_dir           = "/var/uniflow/journal"
 seen_versions_db      = "/var/uniflow/seen.json"
@@ -1137,11 +1294,12 @@ tx_sock               = "/run/uniflow/tx/monitor.sock"
 rx_sock               = "/run/uniflow/rx/manager.sock"
 
 [s3]
+# OPTIONAL TIER. The eight graded processes run with this section absent.
+enabled               = true
 endpoint              = "http://127.0.0.1:9000"   # MinIO, local to each machine
-src_bucket            = "uniflow-src"             # TX only
-dst_bucket            = "uniflow-dst"             # RX only
-poll_interval_s       = 5
-cache_max_bytes       = 8_000_000_000             # LRU evict after transfer completes
+src_bucket            = "uniflow-src"             # TX only, consumed by s3_sync
+dst_bucket            = "uniflow-dst"             # RX only, written by session_manager
+poll_interval_s       = 5                         # s3_sync only; file_monitor never polls
 # credentials come from the environment, never this file:
 #   UNIFLOW_S3_ACCESS_KEY / UNIFLOW_S3_SECRET_KEY
 
@@ -1193,10 +1351,11 @@ For a 1 GB file at `K = 200`, `N = 255`, `symbol_bytes = 1400`:
 | **Kernel rx-queue overrun** | `SO_RXQ_OVFL`, `/proc/net/udp` | Dedicated recv thread, `recvmmsg` batching, large `SO_RCVBUF`, lower pacing | Under-provisioned RX host |
 | **Sender outruns the link** | RX loss far above injected rate | Tier-1 calibration, Tier-2 AIMD, Tier-3 hot reload | **Mis-tuned rate is the #1 practical failure** |
 | **Hash mismatch** | BLAKE3 vs Manifest | Keep in `.partial/`, mark `HASH_MISMATCH`, **never upload to `uniflow-dst`** | — |
-| **Source object deleted mid-flight** | next poll cycle | Transfer continues — the hydrated copy is pinned. **Delete is not a recall**; no cancel exists without a back channel | Receiver stores a file the sender has since deleted |
-| **MinIO down on TX** | S3 client error on poll | Poll retries with backoff; in-flight transfers unaffected (they read the hydrated copy). New objects simply not detected until it returns | Detection stalls silently → alert on consecutive poll failures |
+| **Source file deleted mid-flight** | — | Transfer continues; the sender holds the file open. **Delete is not a recall**; no cancel exists without a back channel | Receiver stores a file the sender has since deleted |
+| **MinIO down on TX** | S3 error in `s3_sync` | **Transfer path unaffected** — `s3_sync` is optional and outside it. Files can still be placed in the watched folder directly | New bucket objects not fed in until it returns |
+| **`s3_sync` stalls or dies** | supervisor / consecutive failures | Detection via inotify is unaffected for anything already local. Alert after N consecutive poll failures | Bucket-sourced files not fed in |
 | **MinIO down on RX** | `PutObject` fails after verify | Verified file stays in `.partial/` with a `PENDING_UPLOAD` marker; retried on a timer. **Never re-transferred** — it already arrived intact | Staging disk fills if MinIO stays down |
-| **Hydration cache full** | `ENOSPC` on `GetObject` stream | Refuse the session, log loudly, LRU-evict completed transfers. Do **not** start a transfer that cannot be hydrated | Concurrent large objects exceed cache budget |
+| **Watched folder full** | `ENOSPC` in `s3_sync` | `s3_sync` refuses the download and logs loudly; nothing half-written is renamed in, so `file_monitor` never sees a partial file | Operator must reclaim space |
 | **Gateway compromised or down** | — | Transfer path is unaffected; it holds no credentials the transfer path needs and pushes nothing to it. `mc` remains a full substitute for the UI | — |
 | **Undecodable after stall** | No progress for 8 s | Fail loudly, name the missing blocks. **Cannot self-heal — no back channel exists.** Recovery is an out-of-band re-send | Inherent to the medium |
 
@@ -1244,7 +1403,9 @@ the transfer still completes and verifies.
 | Manager kill | `kill -9` the manager mid-transfer | attaches (not re-zeroes) shm, completes |
 | Sender kill | `kill -9` a sender mid-transfer | fails cleanly or recovers via repair symbols |
 | Scale | 1 GB across two physical machines | hash verifies within budget |
-| Concurrency | 3 × 8 MB files simultaneously | all three verify |
+| Concurrency | 3 × 8 MB files simultaneously | all three verify, **and the log shows three distinct sender→port pairs** |
+| **Bare mode** | stop MinIO, `s3_sync`, gateway and UI; `cp` a file into the watched folder | full transfer verifies — proves the graded system has no dependency on the optional tier |
+| Source deleted mid-flight | `rm` the file after sending starts | transfer completes; delete is not a recall |
 
 ---
 
@@ -1310,21 +1471,27 @@ the assignment.
 
 ---
 
-### 16.5 Sending directly from S3, without a hydration cache
+### 16.5 S3 as the detection path, replacing the watched folder
 
-**Rejected — it is not possible as stated.** You cannot `mmap` an S3 object, and the entire
-zero-copy sender path is built on `mmap` of a local file. The alternatives considered:
+**Rejected — it violates the brief.** An earlier draft had `file_monitor` poll the bucket
+directly and treat it as the source of truth. Three problems:
 
-| Approach | Verdict |
-|---|---|
-| Range-`GET` each block on demand | Rejected. Turns a sequential local read into thousands of HTTP requests, injects latency inside the pacing loop, and makes the sender depend on MinIO staying up mid-transfer. |
-| Read MinIO's on-disk backing store directly | Rejected. Depends on undocumented internal layout; breaks when erasure-set or versioning config changes. |
-| **Hydrate to a local cache, then `mmap`** | **Accepted.** One extra sequential read, overlapped with the BLAKE3 pass that was needed anyway. Sender code is unchanged from the local-filesystem design. |
+1. The brief requires listening to **creation and modification events in the TX source
+   folder**. A bucket is not a folder on TX, and polling is not listening to events.
+2. **Linux File System I/O Operations** is on the graded self-study list, which signals that
+   filesystem-level monitoring is expected to be demonstrated, not designed around.
+3. You cannot `mmap` an S3 object, so a local copy was needed regardless — meaning the design
+   paid the full cost of a local file *and* gave up the compliant detection mechanism.
 
-Honest accounting: S3 costs one full local read on TX and one full read + upload on RX
-([§13](#13-sizing-math)). In exchange: versioning, multipart semantics that eliminate the
-partial-write race, a real CRUD surface, and object metadata. A reasonable trade against a
-19-second transfer — but **state the cost rather than letting a mentor find it.**
+**Accepted instead:** inotify on a real directory is the single detection path, and
+`s3_sync` ([§5.1.1](#511-s3_sync--the-feeder-not-the-detector)) feeds that directory by
+atomic rename. Same S3 functionality for the user, zero coupling to the graded path, and the
+one-detection-path invariant is preserved rather than weakened — a file arriving via `cp` and
+one arriving via the bucket are indistinguishable to `file_monitor`.
+
+Related and also rejected: range-`GET` per block (thousands of HTTP requests inside the
+pacing loop, and the sender becomes dependent on MinIO staying up mid-transfer), and reading
+MinIO's on-disk backing store directly (undocumented layout).
 
 ### 16.6 AWS S3 instead of MinIO
 
@@ -1368,7 +1535,7 @@ The system's job is not to never fail. It is to fail with a precise, verified an
 |---|---|---|---|
 | **A — C++ TX** | `sender`, `gateway` | RS encode (ISA-L), interleaver, token-bucket pacer + Tier-2 AIMD, wire framing + CRC, `sendmmsg` batching | NestJS: auth, capability resolver + guard, presign endpoints |
 | **B — C++ RX** | `receiver`, `ui` | `recvmmsg` zero-copy ingest, shm arena + lock-free free list, block-table atomics, RS decode, mmap writer, journal | UI: bucket CRUD over presigned URLs |
-| **C — Python + infra** | `file_monitor`, `session_manager`, MinIO deployment | S3 poll+diff+hydrate, session authority, supervision, bitmap aggregation, hash verify, Pybind11 binding, CMake, calibration tool, `tc netem` harness, README | — (C is the critical path; keep them off optional work) |
+| **C — Python + infra** | `file_monitor`, `session_manager` | inotify detection, session authority, **status display**, supervision, UDS aggregation, hash verify, Pybind11 binding, CMake, calibration tool, `tc netem` harness, README | `s3_sync` + MinIO deployment |
 
 **Why the optional tier goes to A and B, not C.** By the tuning window C is running the
 router test and finishing documentation, and C additionally owns the S3 integration on the
@@ -1383,6 +1550,13 @@ bucket deployments and the credential scheme — before either optional componen
   decode path around day 8.
 - **A and B must agree the wire format on day 1**, before either writes a line. That
   agreement *is* `uniflow.proto`.
+- **Clean ownership optimizes for speed and works *against* the brief's collaboration
+  requirement.** If each person only ever touches their own files, the history shows three
+  solo projects sharing a repository — and the brief explicitly grades *"עבודה משותפת
+  ומסודרת של כל חברי הצוות"*. Counteract it deliberately: **every merge reviewed by another
+  member**, **co-authored commits** on `uniflow.proto` and all integration work, and **pair
+  sessions during days 9–10** when the three sides meet. Encode it in branch protection so it
+  happens without anyone having to remember.
 - **C owns merges to `uniflow.proto`.** The schema is the only artifact all three depend on;
   a file owned by everyone and changed by anyone is where three-person projects die. Tag it
   and treat changes as a team decision. **The brief grades Git collaboration — this is
@@ -1421,7 +1595,7 @@ optional.
 |---|---|---|
 | **1–2** | Contract + skeleton + **MinIO** | `uniflow.proto` frozen and tagged. CMake builds an empty C++ binary linking protobuf + ISA-L + BLAKE3. All 8 processes start; `Hello` handshake works. **BLAKE3 cross-implementation test vector verified.** **Both MinIO deployments up, buckets created, versioning on, scoped credentials issued.** |
 | **3** | Link reality check | ICMP probe run; is it a real diode? Result recorded in the README. |
-| **3–5** | **Vertical slice** — no FEC, no shm, localhost | 1 sender → 1 receiver, 1 MB file, hash verifies. S3 poll → hydrate → send → verify → `PutObject` works end to end. Supervisor spawn + `proto_hash` check both sides. *This is the milestone that de-risks everything. Do not skip it.* |
+| **3–5** | **Vertical slice** — no FEC, no shm, localhost | 1 sender → 1 receiver, 1 MB file, hash verifies. `cp` → inotify → send → verify → output. Supervisor spawn + `proto_hash` check both sides. **Ask the mentors the §8.1 arena question.** *This is the milestone that de-risks everything. Do not skip it.* |
 | **6–8** | Reliability layer | CRC prefix, RS encode/decode, interleaving. Green against **your own** `tc netem` before you ever see the mentors' router. Calibration tool + rate ladder. |
 | **9–10** | Scale out to 3+3 | Shared arena, block-table atomics, stateless receivers, session-manager aggregation. **Misrouting test: send all traffic to one port, confirm it still completes.** |
 | **11–12** | Tune | Calibration run, K selected from the table, Tier-2 AIMD, hot reload, socket buffers, 1 GB across two real machines, concurrent small files. Hydration throughput measured. **Heaviest window.** |
